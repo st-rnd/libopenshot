@@ -74,7 +74,8 @@ FFmpegReader::FFmpegReader(const std::string &path, bool inspect_reader)
 		  seek_audio_frame_found(0), seek_video_frame_found(0),is_duration_known(false), largest_frame_processed(0),
 		  current_video_frame(0), packet(NULL), max_concurrent_frames(OPEN_MP_NUM_PROCESSORS), audio_pts(0),
 		  video_pts(0), pFormatCtx(NULL), videoStream(-1), audioStream(-1), pCodecCtx(NULL), aCodecCtx(NULL),
-		  pStream(NULL), aStream(NULL), pFrame(NULL), previous_packet_location{-1,0} {
+		  pStream(NULL), aStream(NULL), pFrame(NULL), previous_packet_location{-1,0},
+		  hold_packet(false) {
 
 	// Initialize FFMpeg, and register all formats and codecs
 	AV_REGISTER_ALL
@@ -213,6 +214,7 @@ void FFmpegReader::Open() {
 		pFormatCtx = NULL;
 		{
 			hw_de_on = (openshot::Settings::Instance()->HARDWARE_DECODER == 0 ? 0 : 1);
+			ZmqLogger::Instance()->AppendDebugMethod("Decode hardware acceleration settings", "hw_de_on", hw_de_on, "HARDWARE_DECODER", openshot::Settings::Instance()->HARDWARE_DECODER);
 		}
 
 		// Open video file
@@ -424,8 +426,12 @@ void FFmpegReader::Open() {
 				}
 
 				// Open video codec
-				if (avcodec_open2(pCodecCtx, pCodec, &opts) < 0)
-					throw InvalidCodec("A video codec was found, but could not be opened.", path);
+				int avcodec_return = avcodec_open2(pCodecCtx, pCodec, &opts);
+				if (avcodec_return < 0) {
+					std::stringstream avcodec_error_msg;
+					avcodec_error_msg << "A video codec was found, but could not be opened. Error: " << av_err2string(avcodec_return);
+					throw InvalidCodec(avcodec_error_msg.str(), path);
+				}
 
 #if USE_HW_ACCEL
 				if (hw_de_on && hw_de_supported) {
@@ -567,13 +573,13 @@ void FFmpegReader::Open() {
 			CheckFPS();
 		}
 
+		// Mark as "open"
+		is_open = true;
+
 		// Seek back to beginning of file (if not already seeking)
 		if (!is_seeking) {
 			Seek(1);
 		}
-
-		// Mark as "open"
-		is_open = true;
 	}
 }
 
@@ -646,6 +652,7 @@ void FFmpegReader::Close() {
 
 		// Reset some variables
 		last_frame = 0;
+		hold_packet = false;
 		largest_frame_processed = 0;
 		seek_audio_frame_found = 0;
 		seek_video_frame_found = 0;
@@ -663,13 +670,20 @@ bool FFmpegReader::HasAlbumArt() {
 }
 
 void FFmpegReader::UpdateAudioInfo() {
+	// Set default audio channel layout (if needed)
+	if (AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channel_layout == 0)
+		AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channel_layout = av_get_default_channel_layout(AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channels);
+
+	if (info.sample_rate > 0) {
+		// Skip init - if info struct already populated
+		return;
+	}
+
 	// Set values of FileInfo struct
 	info.has_audio = true;
 	info.file_size = pFormatCtx->pb ? avio_size(pFormatCtx->pb) : -1;
 	info.acodec = aCodecCtx->codec->name;
 	info.channels = AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channels;
-	if (AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channel_layout == 0)
-		AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channel_layout = av_get_default_channel_layout(AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channels);
 	info.channel_layout = (ChannelLayout) AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channel_layout;
 	info.sample_rate = AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->sample_rate;
 	info.audio_bit_rate = AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->bit_rate;
@@ -713,6 +727,16 @@ void FFmpegReader::UpdateAudioInfo() {
 		info.video_length = info.duration * info.fps.ToDouble();
 		info.width = 720;
 		info.height = 480;
+
+		// Use timeline to set correct width & height (if any)
+		Clip *parent = static_cast<Clip *>(ParentClip());
+		if (parent) {
+			if (parent->ParentTimeline()) {
+				// Set max width/height based on parent clip's timeline (if attached to a timeline)
+				info.width = parent->ParentTimeline()->preview_width;
+				info.height = parent->ParentTimeline()->preview_height;
+			}
+		}
 	}
 
 	// Fix invalid video lengths for certain types of files (MP3 for example)
@@ -730,6 +754,11 @@ void FFmpegReader::UpdateAudioInfo() {
 }
 
 void FFmpegReader::UpdateVideoInfo() {
+	if (info.vcodec.length() > 0) {
+		// Skip init - if info struct already populated
+		return;
+	}
+
 	// Set values of FileInfo struct
 	info.has_video = true;
 	info.file_size = pFormatCtx->pb ? avio_size(pFormatCtx->pb) : -1;
@@ -817,6 +846,14 @@ void FFmpegReader::UpdateVideoInfo() {
 	if (info.duration <= 0.0f && info.video_bit_rate > 0 && info.file_size > 0) {
 		// Estimate from bitrate, total bytes, and framerate
 		info.duration = float(info.file_size) / info.video_bit_rate;
+	}
+
+	// Certain "image" formats do not have a valid duration
+	if (info.duration <= 0.0f && pStream->duration == AV_NOPTS_VALUE && pFormatCtx->duration == AV_NOPTS_VALUE) {
+		// Force an "image" duration
+		info.duration = 60 * 60 * 1;  // 1 hour duration
+		info.video_length = 1;
+		info.has_single_image = true;
 	}
 
 	// Get the # of video frames (if found in stream)
@@ -944,11 +981,13 @@ std::shared_ptr<Frame> FFmpegReader::ReadStream(int64_t requested_frame) {
 			break;
 		}
 
-		// Get the next packet
-		packet_error = GetNextPacket();
-		if (packet_error < 0 && !packet) {
-			// No more packets to be found
-			packet_status.packets_eof = true;
+		if (!hold_packet || !packet) {
+			// Get the next packet
+			packet_error = GetNextPacket();
+			if (packet_error < 0 && !packet) {
+				// No more packets to be found
+				packet_status.packets_eof = true;
+			}
 		}
 
 		// Debug output
@@ -969,7 +1008,7 @@ std::shared_ptr<Frame> FFmpegReader::ReadStream(int64_t requested_frame) {
 
 		// Video packet
 		if ((info.has_video && packet && packet->stream_index == videoStream) ||
-			(info.has_video && !packet && packet_status.video_decoded < packet_status.video_read) ||
+			(info.has_video && packet_status.video_decoded < packet_status.video_read) ||
 			(info.has_video && !packet && !packet_status.video_eof)) {
 			// Process Video Packet
 			ProcessVideoPacket(requested_frame);
@@ -1044,13 +1083,26 @@ std::shared_ptr<Frame> FFmpegReader::ReadStream(int64_t requested_frame) {
 
 		// Check if largest frame is still cached
 		frame = final_cache.GetFrame(largest_frame_processed);
+		int samples_in_frame = Frame::GetSamplesPerFrame(requested_frame, info.fps,
+														 info.sample_rate, info.channels);
 		if (frame) {
-			// return the largest processed frame (assuming it was the last in the video file)
+			// Copy and return the largest processed frame (assuming it was the last in the video file)
+			std::shared_ptr<Frame> f = CreateFrame(largest_frame_processed);
+
+			// Use solid color (if no image data found)
+			if (!frame->has_image_data) {
+				// Use solid black frame if no image data available
+				f->AddColor(info.width, info.height, "#000");
+			}
+			// Silence audio data (if any), since we are repeating the last frame
+			frame->AddAudioSilence(samples_in_frame);
+
 			return frame;
 		} else {
 			// The largest processed frame is no longer in cache, return a blank frame
 			std::shared_ptr<Frame> f = CreateFrame(largest_frame_processed);
 			f->AddColor(info.width, info.height, "#000");
+			f->AddAudioSilence(samples_in_frame);
 			return f;
 		}
 	}
@@ -1096,7 +1148,17 @@ bool FFmpegReader::GetAVFrame() {
 	AVFrame *next_frame = AV_ALLOCATE_FRAME();
 
 #if IS_FFMPEG_3_2
-	int send_packet_err = avcodec_send_packet(pCodecCtx, packet);
+	int send_packet_err = 0;
+	int64_t send_packet_pts = 0;
+	if ((packet && packet->stream_index == videoStream && !hold_packet) || !packet) {
+		send_packet_err = avcodec_send_packet(pCodecCtx, packet);
+
+		if (packet && send_packet_err >= 0) {
+			send_packet_pts = GetPacketPTS();
+			hold_packet = false;
+			ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (send packet succeeded)", "send_packet_err", send_packet_err, "send_packet_pts", send_packet_pts);
+		}
+	}
 
 	#if USE_HW_ACCEL
 		// Get the format from the variables set in get_hw_dec_format
@@ -1104,85 +1166,117 @@ bool FFmpegReader::GetAVFrame() {
 		hw_de_av_device_type = hw_de_av_device_type_global;
 	#endif // USE_HW_ACCEL
 		if (send_packet_err < 0 && send_packet_err != AVERROR_EOF) {
-			ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (Packet not sent)",
-											"send_packet_err", send_packet_err);
+			ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (send packet: Not sent [" + av_err2string(send_packet_err) + "])", "send_packet_err", send_packet_err, "send_packet_pts", send_packet_pts);
+			if (send_packet_err == AVERROR(EAGAIN)) {
+				hold_packet = true;
+				ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (send packet: AVERROR(EAGAIN): user must read output with avcodec_receive_frame()", "send_packet_pts", send_packet_pts);
+			}
+			if (send_packet_err == AVERROR(EINVAL)) {
+				ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (send packet: AVERROR(EINVAL): codec not opened, it is an encoder, or requires flush", "send_packet_pts", send_packet_pts);
+			}
+			if (send_packet_err == AVERROR(ENOMEM)) {
+				ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (send packet: AVERROR(ENOMEM): failed to add packet to internal queue, or legitimate decoding errors", "send_packet_pts", send_packet_pts);
+			}
 		}
-		else {
-			int receive_frame_err = 0;
-			AVFrame *next_frame2;
-	#if USE_HW_ACCEL
-			if (hw_de_on && hw_de_supported) {
-				next_frame2 = AV_ALLOCATE_FRAME();
-			}
-			else
-	#endif // USE_HW_ACCEL
-			{
-				next_frame2 = next_frame;
-			}
-			pFrame = AV_ALLOCATE_FRAME();
-			while (receive_frame_err >= 0) {
-				receive_frame_err = avcodec_receive_frame(pCodecCtx, next_frame2);
+
+		// Always try and receive a packet, if not EOF.
+		// Even if the above avcodec_send_packet failed to send,
+		// we might still need to receive a packet.
+		int receive_frame_err = 0;
+		AVFrame *next_frame2;
+#if USE_HW_ACCEL
+		if (hw_de_on && hw_de_supported) {
+			next_frame2 = AV_ALLOCATE_FRAME();
+		}
+		else
+#endif // USE_HW_ACCEL
+		{
+			next_frame2 = next_frame;
+		}
+		pFrame = AV_ALLOCATE_FRAME();
+		while (receive_frame_err >= 0) {
+			receive_frame_err = avcodec_receive_frame(pCodecCtx, next_frame2);
+
+			if (receive_frame_err != 0) {
+				ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (receive frame: frame not ready yet from decoder [\" + av_err2string(receive_frame_err) + \"])", "receive_frame_err", receive_frame_err, "send_packet_pts", send_packet_pts);
 
 				if (receive_frame_err == AVERROR_EOF) {
-					ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (EOF detected from decoder)");
+					ZmqLogger::Instance()->AppendDebugMethod(
+							"FFmpegReader::GetAVFrame (receive frame: AVERROR_EOF: EOF detected from decoder, flushing buffers)", "send_packet_pts", send_packet_pts);
+					avcodec_flush_buffers(pCodecCtx);
 					packet_status.video_eof = true;
 				}
-				if (receive_frame_err == AVERROR(EINVAL) || receive_frame_err == AVERROR_EOF) {
-					ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (invalid frame received or EOF from decoder)");
+				if (receive_frame_err == AVERROR(EINVAL)) {
+					ZmqLogger::Instance()->AppendDebugMethod(
+							"FFmpegReader::GetAVFrame (receive frame: AVERROR(EINVAL): invalid frame received, flushing buffers)", "send_packet_pts", send_packet_pts);
 					avcodec_flush_buffers(pCodecCtx);
 				}
-				if (receive_frame_err != 0) {
-					ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (frame not ready yet from decoder)");
-					break;
+				if (receive_frame_err == AVERROR(EAGAIN)) {
+					ZmqLogger::Instance()->AppendDebugMethod(
+							"FFmpegReader::GetAVFrame (receive frame: AVERROR(EAGAIN): output is not available in this state - user must try to send new input)", "send_packet_pts", send_packet_pts);
+				}
+				if (receive_frame_err == AVERROR_INPUT_CHANGED) {
+					ZmqLogger::Instance()->AppendDebugMethod(
+							"FFmpegReader::GetAVFrame (receive frame: AVERROR_INPUT_CHANGED: current decoded frame has changed parameters with respect to first decoded frame)", "send_packet_pts", send_packet_pts);
 				}
 
-	#if USE_HW_ACCEL
-				if (hw_de_on && hw_de_supported) {
-					int err;
-					if (next_frame2->format == hw_de_av_pix_fmt) {
-						next_frame->format = AV_PIX_FMT_YUV420P;
-						if ((err = av_hwframe_transfer_data(next_frame,next_frame2,0)) < 0) {
-							ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (Failed to transfer data to output frame)");
-						}
-						if ((err = av_frame_copy_props(next_frame,next_frame2)) < 0) {
-							ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (Failed to copy props to output frame)");
-						}
-					}
-				}
-				else
-	#endif // USE_HW_ACCEL
-				{	// No hardware acceleration used -> no copy from GPU memory needed
-					next_frame = next_frame2;
-				}
-
-				// TODO also handle possible further frames
-				// Use only the first frame like avcodec_decode_video2
-				frameFinished = 1;
-				packet_status.video_decoded++;
-
-				av_image_alloc(pFrame->data, pFrame->linesize, info.width, info.height, (AVPixelFormat)(pStream->codecpar->format), 1);
-				av_image_copy(pFrame->data, pFrame->linesize, (const uint8_t**)next_frame->data, next_frame->linesize,
-											(AVPixelFormat)(pStream->codecpar->format), info.width, info.height);
-
-				// Get display PTS from video frame, often different than packet->pts.
-				// Sending packets to the decoder (i.e. packet->pts) is async,
-				// and retrieving packets from the decoder (frame->pts) is async. In most decoders
-				// sending and retrieving are separated by multiple calls to this method.
-				if (next_frame->pts != AV_NOPTS_VALUE) {
-					// This is the current decoded frame (and should be the pts used) for
-					// processing this data
-					video_pts = next_frame->pts;
-				}
-
-				// break out of loop after each successful image returned
+				// Break out of decoding loop
+				// Nothing ready for decoding yet
 				break;
 			}
-	#if USE_HW_ACCEL
+
+#if USE_HW_ACCEL
 			if (hw_de_on && hw_de_supported) {
-				AV_FREE_FRAME(&next_frame2);
+				int err;
+				if (next_frame2->format == hw_de_av_pix_fmt) {
+					next_frame->format = AV_PIX_FMT_YUV420P;
+					if ((err = av_hwframe_transfer_data(next_frame,next_frame2,0)) < 0) {
+						ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (Failed to transfer data to output frame)", "hw_de_on", hw_de_on);
+					}
+					if ((err = av_frame_copy_props(next_frame,next_frame2)) < 0) {
+						ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::GetAVFrame (Failed to copy props to output frame)", "hw_de_on", hw_de_on);
+					}
+				}
 			}
-	#endif // USE_HW_ACCEL
+			else
+#endif // USE_HW_ACCEL
+			{	// No hardware acceleration used -> no copy from GPU memory needed
+				next_frame = next_frame2;
+			}
+
+			// TODO also handle possible further frames
+			// Use only the first frame like avcodec_decode_video2
+			frameFinished = 1;
+			packet_status.video_decoded++;
+
+			av_image_alloc(pFrame->data, pFrame->linesize, info.width, info.height, (AVPixelFormat)(pStream->codecpar->format), 1);
+			av_image_copy(pFrame->data, pFrame->linesize, (const uint8_t**)next_frame->data, next_frame->linesize,
+										(AVPixelFormat)(pStream->codecpar->format), info.width, info.height);
+
+			// Get display PTS from video frame, often different than packet->pts.
+			// Sending packets to the decoder (i.e. packet->pts) is async,
+			// and retrieving packets from the decoder (frame->pts) is async. In most decoders
+			// sending and retrieving are separated by multiple calls to this method.
+			if (next_frame->pts != AV_NOPTS_VALUE) {
+				// This is the current decoded frame (and should be the pts used) for
+				// processing this data
+				video_pts = next_frame->pts;
+			} else if (next_frame->pkt_dts != AV_NOPTS_VALUE) {
+				// Some videos only set this timestamp (fallback)
+				video_pts = next_frame->pkt_dts;
+			}
+
+			ZmqLogger::Instance()->AppendDebugMethod(
+					"FFmpegReader::GetAVFrame (Successful frame received)", "video_pts", video_pts, "send_packet_pts", send_packet_pts);
+
+			// break out of loop after each successful image returned
+			break;
 		}
+#if USE_HW_ACCEL
+		if (hw_de_on && hw_de_supported) {
+			AV_FREE_FRAME(&next_frame2);
+		}
+	#endif // USE_HW_ACCEL
 #else
 		avcodec_decode_video2(pCodecCtx, next_frame, &frameFinished, packet);
 
@@ -1265,6 +1359,9 @@ void FFmpegReader::ProcessVideoPacket(int64_t requested_frame) {
 	// Check if the AVFrame is finished and set it
 	if (!frame_finished) {
 		// No AVFrame decoded yet, bail out
+		if (pFrame) {
+			RemoveAVFrame(pFrame);
+		}
 		return;
 	}
 
@@ -1289,8 +1386,6 @@ void FFmpegReader::ProcessVideoPacket(int64_t requested_frame) {
 	int height = info.height;
 	int width = info.width;
 	int64_t video_length = info.video_length;
-	AVFrame *my_frame = pFrame;
-	pFrame = NULL;
 
 	// Create variables for a RGB Frame (since most videos are not in RGB, we must convert it)
 	AVFrame *pFrameRGB = nullptr;
@@ -1309,7 +1404,7 @@ void FFmpegReader::ProcessVideoPacket(int64_t requested_frame) {
 	int max_width = info.width;
 	int max_height = info.height;
 
-	Clip *parent = (Clip *) ParentClip();
+	Clip *parent = static_cast<Clip *>(ParentClip());
 	if (parent) {
 		if (parent->ParentTimeline()) {
 			// Set max width/height based on parent clip's timeline (if attached to a timeline)
@@ -1391,7 +1486,7 @@ void FFmpegReader::ProcessVideoPacket(int64_t requested_frame) {
 												 height, PIX_FMT_RGBA, scale_mode, NULL, NULL, NULL);
 
 	// Resize / Convert to RGB
-	sws_scale(img_convert_ctx, my_frame->data, my_frame->linesize, 0,
+	sws_scale(img_convert_ctx, pFrame->data, pFrame->linesize, 0,
 			  original_height, pFrameRGB->data, pFrameRGB->linesize);
 
 	// Create or get the existing frame object
@@ -1416,7 +1511,7 @@ void FFmpegReader::ProcessVideoPacket(int64_t requested_frame) {
 	AV_FREE_FRAME(&pFrameRGB);
 
 	// Remove frame and packet
-	RemoveAVFrame(my_frame);
+	RemoveAVFrame(pFrame);
 	sws_freeContext(img_convert_ctx);
 
 	// Get video PTS in seconds
@@ -1505,6 +1600,11 @@ void FFmpegReader::ProcessAudioPacket(int64_t requested_frame) {
 
 		// Calculate total number of samples
 		packet_samples = audio_frame->nb_samples * AV_GET_CODEC_ATTRIBUTES(aStream, aCodecCtx)->channels;
+	} else {
+		if (audio_frame) {
+			// Free audio frame
+			AV_FREE_FRAME(&audio_frame);
+		}
 	}
 
 	// Estimate the # of samples and the end of this packet's location (to prevent GAPS for the next timestamp)
@@ -1718,6 +1818,10 @@ void FFmpegReader::Seek(int64_t requested_frame) {
 		requested_frame = 1;
 	if (requested_frame > info.video_length)
 		requested_frame = info.video_length;
+	if (requested_frame > largest_frame_processed && packet_status.end_of_file) {
+		// Not possible to search past largest_frame once EOF is reached (no more packets)
+		return;
+	}
 
 	// Debug output
 	ZmqLogger::Instance()->AppendDebugMethod("FFmpegReader::Seek",
@@ -1733,6 +1837,7 @@ void FFmpegReader::Seek(int64_t requested_frame) {
 	video_pts_seconds = NO_PTS_OFFSET;
 	audio_pts = 0.0;
 	audio_pts_seconds = NO_PTS_OFFSET;
+	hold_packet = false;
 	last_frame = 0;
 	current_video_frame = 0;
 	largest_frame_processed = 0;
@@ -1849,12 +1954,17 @@ void FFmpegReader::Seek(int64_t requested_frame) {
 
 // Get the PTS for the current video packet
 int64_t FFmpegReader::GetPacketPTS() {
-	int64_t current_pts = packet->pts;
-	if (current_pts == AV_NOPTS_VALUE && packet->dts != AV_NOPTS_VALUE)
-		current_pts = packet->dts;
+	if (packet) {
+		int64_t current_pts = packet->pts;
+		if (current_pts == AV_NOPTS_VALUE && packet->dts != AV_NOPTS_VALUE)
+			current_pts = packet->dts;
 
-	// Return adjusted PTS
-	return current_pts;
+		// Return adjusted PTS
+		return current_pts;
+	} else {
+		// No packet, return NO PTS
+		return AV_NOPTS_VALUE;
+	}
 }
 
 // Update PTS Offset (if any)
